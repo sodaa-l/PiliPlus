@@ -1,0 +1,273 @@
+# 独立的 Android APK 发布流水线
+#
+# 设计前提：完全不碰 aierlma 原有的 iOS 流水线（.github/workflows/btr-maintain.yml）
+# 与发布脚本（tool/btr_release.py）——那两个文件里写死了 aierlma/PiliPlus 仓库名，
+# 在 fork 里本来就会拒绝运行。本文件只做一件事：
+#   跟上 aierlma/PiliPlus 的 btr 分支 → 构建 3 个 ABI 拆分的 release APK → 打自己的 tag 发 release。
+#
+# 首次使用需要手动做三件事：
+#   1. fork 的 Actions 页点「I understand my workflows, go ahead and enable them」；
+#   2. 想让它每天自动跑，确认本 workflow 处于 Enabled 状态（fork 的 schedule 默认不生效）；
+#   3. 可选：配置签名 secrets（SIGN_KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD），
+#      不配置则回退为 debug 签名（能装，但签名与自建 release 签名不通用）。
+
+name: BTR Android APK release
+
+on:
+  schedule:
+    # 每天 UTC 12:47（北京时间 20:47）。aierlma 的 iOS 流水线是 UTC 11:17 触发，
+    # 留出约 90 分钟让它先把合并后的 btr 分支推上去，这里才不会构建到旧代码。
+    - cron: '47 12 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 即使该版本已经发过 release，也重新构建并覆盖附件
+        type: boolean
+        default: false
+
+concurrency:
+  group: btr-android-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # aierlma/PiliPlus：BTR + 上游合并后的 btr 分支，本流水线的构建来源
+  SOURCE_REPO: https://github.com/aierlma/PiliPlus.git
+  # 官方 PiliPlus（仅用于在 build-info.json 里记录基线）
+  UPSTREAM_REPO: https://github.com/bggRGjQaUbCoE/PiliPlus.git
+  # BTR 作者的上游（仅用于在 build-info.json 里记录基线）
+  BTR_UPSTREAM_REPO: https://github.com/nishuodedui1145-del/PiliPlus.git
+
+jobs:
+  resolve:
+    name: 解析构建来源与目标 tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      skip: ${{ steps.target.outputs.skip }}
+      sha: ${{ steps.target.outputs.sha }}
+      version: ${{ steps.target.outputs.version }}
+      build: ${{ steps.target.outputs.build }}
+      tag: ${{ steps.target.outputs.tag }}
+      upstream: ${{ steps.target.outputs.upstream }}
+      btr_upstream: ${{ steps.target.outputs.btr_upstream }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: btr
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 解析来源提交、版本号与 tag
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          git fetch --no-tags "$SOURCE_REPO" btr
+          source_sha=$(git rev-parse FETCH_HEAD)
+
+          # 能快进就构建 aierlma 的最新 btr；不能快进说明 fork 自己有了提交，退化为构建 fork 自己的 btr。
+          if git merge-base --is-ancestor HEAD "$source_sha"; then
+            target="$source_sha"
+          else
+            target=$(git rev-parse HEAD)
+            echo "::warning::fork 的 btr 与 aierlma/PiliPlus 的 btr 已经分叉，本次只构建 fork 自己的 btr（${target:0:12}）。要跟上上游，请在 fork 页面点 Sync fork → Discard commits。"
+          fi
+
+          git fetch --no-tags "$UPSTREAM_REPO" main
+          upstream=$(git rev-parse FETCH_HEAD)
+          git fetch --no-tags "$BTR_UPSTREAM_REPO" btr
+          btr_upstream=$(git rev-parse FETCH_HEAD)
+
+          version=$(git show "$target:pubspec.yaml" | sed -n 's/^version:[[:space:]]*\([0-9][0-9.]*\).*/\1/p' | head -n1)
+          if [ -z "$version" ]; then
+            echo "::error::无法从 $target 的 pubspec.yaml 解析版本号"
+            exit 1
+          fi
+          build=$(git rev-list --count "$target")
+          tag="v${version}-btr.${build}-${target:0:12}-android"
+
+          # 同一个来源提交已经发过就直接跳过，省掉一次 30 分钟以上的构建。
+          skip=false
+          if [ "$FORCE" != "true" ] && gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $tag 已存在，跳过本次构建"
+            skip=true
+          fi
+
+          {
+            echo "sha=$target"
+            echo "version=$version"
+            echo "build=$build"
+            echo "tag=$tag"
+            echo "upstream=$upstream"
+            echo "btr_upstream=$btr_upstream"
+            echo "skip=$skip"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: 构建 APK 并发布 release
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: btr
+          fetch-depth: 0
+
+      # build job 是全新的 runner，fork 里可能还没有 aierlma 那条流水线新推的提交，所以先取到
+      # 目标提交，再把它落到 fork 的 btr 分支上 —— release 的 tag 必须指向一个 fork 里真实存在
+      # 的提交。两种情况都是非强制推送：要么是快进，要么本来就是 btr 的顶点（no-op）。
+      - name: 取出目标提交并同步到 fork 的 btr 分支
+        env:
+          TARGET: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if ! git cat-file -e "${TARGET}^{commit}" 2>/dev/null; then
+            git fetch --no-tags "$SOURCE_REPO" btr
+          fi
+          if ! git cat-file -e "${TARGET}^{commit}" 2>/dev/null; then
+            echo "::error::无法取得目标提交 $TARGET"
+            exit 1
+          fi
+          git push origin "${TARGET}:refs/heads/btr"
+          git checkout --detach "$TARGET"
+
+      - name: 构建 Java 环境
+        uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: |
+            android/*.gradle*
+            android/**/gradle-wrapper.properties
+
+      - name: 安装 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version-file: pubspec.yaml
+          cache: true
+
+      - name: 打 Flutter SDK 与 material_ui 补丁（含 flutter pub get）
+        shell: pwsh
+        run: lib/scripts/patch.ps1 android
+
+      - name: 写入签名密钥
+        id: signing
+        env:
+          SIGN_KEYSTORE_BASE64: ${{ secrets.SIGN_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SIGN_KEYSTORE_BASE64" ]; then
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::没有配置 SIGN_KEYSTORE_BASE64 等 secrets，本次 APK 使用 debug 签名（可安装，但签名与自建 keystore 的包不通用，无法互相覆盖安装）"
+            exit 0
+          fi
+          echo "$SIGN_KEYSTORE_BASE64" | base64 --decode > android/app/key.jks
+          {
+            echo "storeFile=key.jks"
+            echo "storePassword=$KEYSTORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } >> android/key.properties
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
+      - name: 写版本号与 pili_release.json
+        shell: pwsh
+        run: lib/scripts/build.ps1 android
+
+      - name: 构建 release APK（按 ABI 拆分）
+        run: flutter build apk --release --split-per-abi --dart-define-from-file=pili_release.json --android-project-arg btr=1 --no-pub
+
+      - name: 重命名并生成校验信息
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          BUILD: ${{ needs.resolve.outputs.build }}
+          SOURCE_SHA: ${{ needs.resolve.outputs.sha }}
+          UPSTREAM: ${{ needs.resolve.outputs.upstream }}
+          BTR_UPSTREAM: ${{ needs.resolve.outputs.btr_upstream }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          for file in build/app/outputs/flutter-apk/app-*-release.apk; do
+            abi=$(basename "$file" | sed -E 's/^app-(.*)-release\.apk$/\1/')
+            mv "$file" "PiliPlus-BTR-android-${VERSION}-btr.${BUILD}-${abi}.apk"
+          done
+          ls -l PiliPlus-BTR-android-*.apk
+
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+
+          apks = {}
+          for path in sorted(pathlib.Path('.').glob('PiliPlus-BTR-android-*.apk')):
+              data = path.read_bytes()
+              apks[path.name] = {
+                  'sha256': hashlib.sha256(data).hexdigest(),
+                  'size': len(data),
+              }
+
+          info = {
+              'tag': os.environ['TAG'],
+              'version': os.environ['VERSION'],
+              'build': os.environ['BUILD'],
+              'source_sha': os.environ['SOURCE_SHA'],
+              'official_upstream': os.environ['UPSTREAM'],
+              'btr_upstream': os.environ['BTR_UPSTREAM'],
+              'application_id': 'com.example.piliplus.btr',
+              'apks': apks,
+          }
+          pathlib.Path('PiliPlus-BTR-android-build-info.json').write_text(
+              json.dumps(info, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+          print(json.dumps(info, indent=2, ensure_ascii=False))
+          PY
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v7
+        with:
+          archive: false
+          name: BTR-android-apks
+          path: |
+            PiliPlus-BTR-android-*.apk
+            PiliPlus-BTR-android-build-info.json
+          retention-days: 14
+
+      - name: 发布 release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          target_commitish: ${{ needs.resolve.outputs.sha }}
+          name: PiliPlus BTR Android ${{ needs.resolve.outputs.version }} (build ${{ needs.resolve.outputs.build }})
+          files: |
+            PiliPlus-BTR-android-*.apk
+            PiliPlus-BTR-android-build-info.json
+          body: |
+            PiliPlus BTR 安卓版（含 BTR 多 Range 并发加速），与 aierlma 的 iOS IPA 构建自同一个来源提交。
+
+            - 版本：${{ needs.resolve.outputs.version }}（build ${{ needs.resolve.outputs.build }}）
+            - 来源提交：`${{ needs.resolve.outputs.sha }}`
+            - 官方 PiliPlus 上游：`${{ needs.resolve.outputs.upstream }}`
+            - BTR 作者上游：`${{ needs.resolve.outputs.btr_upstream }}`
+            - 应用 ID：`com.example.piliplus.btr`（可与官方版 `com.example.piliplus` 共存安装）
+            - 签名：${{ steps.signing.outputs.signed == 'true' && '自有 keystore（release 签名）' || 'debug 签名（未配置签名 secrets）' }}
+
+            附件为 3 个按 ABI 拆分的 APK（`arm64-v8a` / `armeabi-v7a` / `x86_64`），
+            手机一般装 `arm64-v8a`；每个 APK 的 SHA-256 记录在 `PiliPlus-BTR-android-build-info.json` 里。
+
+            构建来源：`.github/workflows/android-release.yml`（本仓库独立流水线，不影响上游的 IPA 发布）。
