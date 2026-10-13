@@ -3,7 +3,8 @@
 # 设计前提：完全不碰 aierlma 原有的 iOS 流水线（.github/workflows/btr-maintain.yml）
 # 与发布脚本（tool/btr_release.py）——那两个文件里写死了 aierlma/PiliPlus 仓库名，
 # 在 fork 里本来就会拒绝运行。本文件只做一件事：
-#   跟上 aierlma/PiliPlus 的 btr 分支 → 构建 3 个 ABI 拆分的 release APK → 打自己的 tag 发 release。
+#   构建 aierlma/PiliPlus 的 btr 最新提交 → 产出 3 个 ABI 拆分的 release APK → 打自己的 tag 发 release。
+#   它不读也不改你 fork 的 btr 内容，只借一个专用分支 btr-android-build 寄存构建用的提交。
 #
 # 首次使用需要手动做三件事：
 #   1. fork 的 Actions 页点「I understand my workflows, go ahead and enable them」；
@@ -70,16 +71,11 @@ jobs:
         run: |
           set -euo pipefail
 
+          # 恒定构建 aierlma/PiliPlus 的 btr 最新提交 —— 也就是它那些 IPA 对应的代码。
+          # 不构建 fork 自己的 btr：你往 btr 上提交任何东西（包括本 workflow 文件）都会和上游分叉，
+          # 那样只会一直构建旧代码。想让 fork 的 btr 也跟上，自己去点 Sync fork 即可。
           git fetch --no-tags "$SOURCE_REPO" btr
-          source_sha=$(git rev-parse FETCH_HEAD)
-
-          # 能快进就构建 aierlma 的最新 btr；不能快进说明 fork 自己有了提交，退化为构建 fork 自己的 btr。
-          if git merge-base --is-ancestor HEAD "$source_sha"; then
-            target="$source_sha"
-          else
-            target=$(git rev-parse HEAD)
-            echo "::warning::fork 的 btr 与 aierlma/PiliPlus 的 btr 已经分叉，本次只构建 fork 自己的 btr（${target:0:12}）。要跟上上游，请在 fork 页面点 Sync fork → Discard commits。"
-          fi
+          target=$(git rev-parse FETCH_HEAD)
 
           git fetch --no-tags "$UPSTREAM_REPO" main
           upstream=$(git rev-parse FETCH_HEAD)
@@ -125,10 +121,10 @@ jobs:
           ref: btr
           fetch-depth: 0
 
-      # build job 是全新的 runner，fork 里可能还没有 aierlma 那条流水线新推的提交，所以先取到
-      # 目标提交，再把它落到 fork 的 btr 分支上 —— release 的 tag 必须指向一个 fork 里真实存在
-      # 的提交。两种情况都是非强制推送：要么是快进，要么本来就是 btr 的顶点（no-op）。
-      - name: 取出目标提交并同步到 fork 的 btr 分支
+      # build job 是全新的 runner，fork 里可能还没有 aierlma 那条流水线新推的提交，所以先取到目标提交。
+      # release 的 tag 必须指向 fork 里真实存在的提交，所以把它寄存到专用分支 btr-android-build 上，
+      # 完全不动你的 btr 分支。aierlma 的 btr 只会往前走，因此这是一条非强制的快进推送。
+      - name: 取出目标提交并落到专用分支
         env:
           TARGET: ${{ needs.resolve.outputs.sha }}
         run: |
@@ -140,7 +136,7 @@ jobs:
             echo "::error::无法取得目标提交 $TARGET"
             exit 1
           fi
-          git push origin "${TARGET}:refs/heads/btr"
+          git push origin "${TARGET}:refs/heads/btr-android-build"
           git checkout --detach "$TARGET"
 
       - name: 构建 Java 环境
