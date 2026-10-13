@@ -160,6 +160,22 @@ jobs:
         shell: pwsh
         run: lib/scripts/patch.ps1 android
 
+      # 与 aierlma 那条完全相同的 BTR 测试（同一份代码、同一组文件）。多花 1~3 分钟，换来的
+      # 区别是：「发布的这份包通过了 BTR 测试」由本流水线自证，而不是靠相信上游。
+      # make_btr_mirror.py 必须先跑：它把 lib/services/btr_proxy/ 镜像到 test/standalone/btr/
+      # 并生成最小桩，下面这 6 个 standalone 测试依赖这些生成物。
+      - name: 跑 BTR 测试
+        run: |
+          set -euo pipefail
+          python3 tool/make_btr_mirror.py
+          flutter test --no-pub \
+            test/utils/storage_pref_test.dart \
+            test/standalone/btr_bitrate_unit_test.dart \
+            test/standalone/btr_cdn_racer_test.dart \
+            test/standalone/btr_round22_test.dart \
+            test/standalone/btr_round23_test.dart \
+            test/standalone/btr_round26_test.dart
+
       - name: 写入签名密钥
         id: signing
         env:
@@ -252,6 +268,149 @@ jobs:
           print(json.dumps(info, indent=2, ensure_ascii=False))
           PY
 
+      # 发布前的最后一道闸：任何一项不过就 exit 1，整个 job 失败，坏包发不出去。
+      # 相当于给 Android 补上 aierlma 那条流水线里的 verify_btr_ipa.py。
+      - name: 校验 APK（Android 版 verify_btr_ipa）
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          BUILD: ${{ needs.resolve.outputs.build }}
+          SIGNED: ${{ steps.signing.outputs.signed }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          if [ -z "${version:-}" ]; then
+            echo "::error::拿不到 build.ps1 写入的 version，无法校验版本名"
+            exit 1
+          fi
+          export APP_VERSION="${version%%+*}"
+          echo "期望：applicationId=com.example.piliplus.btr 版本名=$APP_VERSION build=$BUILD 已配置签名=$SIGNED"
+          python3 - <<'PY'
+          import glob, os, subprocess, sys, zipfile
+
+          ABIS = ["arm64-v8a", "armeabi-v7a", "x86_64"]
+          APP_ID = "com.example.piliplus.btr"
+          VERSION = os.environ["VERSION"]
+          BUILD = os.environ["BUILD"]
+          APP_VERSION = os.environ["APP_VERSION"]
+          SIGNED = os.environ.get("SIGNED", "")
+          STORE_PASSWORD = os.environ.get("KEYSTORE_PASSWORD", "")
+          KEY_ALIAS = os.environ.get("KEY_ALIAS", "")
+          MIN_BYTES = 1024 * 1024
+          problems = []
+
+
+          def run_cmd(args):
+              return subprocess.run(args, capture_output=True, text=True, errors="replace")
+
+
+          def fail(message):
+              problems.append(message)
+
+
+          def parse_sha256(text):
+              # 兼容三种写法：apksigner 的 "Signer #1 certificate SHA-256 digest: <hex>"、
+              # keytool 的 "SHA256: AA:BB:..."、以及 "SHA-256:" 变体。
+              # 注意 apksigner 的冒号在 digest 之后，所以要先定位到 sha256 之后的冒号再取十六进制串。
+              for line in text.splitlines():
+                  compact = line.replace(" ", "").replace("-", "").lower()
+                  index = compact.find("sha256")
+                  if index < 0:
+                      continue
+                  tail = compact[index + 6:]
+                  colon = tail.find(":")
+                  if colon < 0:
+                      continue
+                  value = "".join(ch for ch in tail[colon + 1:] if ch in "0123456789abcdef")
+                  if len(value) >= 64:
+                      return value[:64]
+              return ""
+
+
+          def apksigner_path():
+              for root in (os.environ.get("ANDROID_HOME"), os.environ.get("ANDROID_SDK_ROOT")):
+                  if not root:
+                      continue
+                  found = sorted(glob.glob(os.path.join(root, "build-tools", "*", "apksigner")))
+                  if found:
+                      return found[-1]
+              return ""
+
+
+          expected = ""
+          if SIGNED == "true":
+              if not STORE_PASSWORD:
+                  fail("签名已启用，但读不到 KEYSTORE_PASSWORD，无法比对签名指纹")
+              else:
+                  out = run_cmd(["keytool", "-list", "-v", "-keystore", "android/app/key.jks",
+                                 "-storepass", STORE_PASSWORD, "-alias", KEY_ALIAS])
+                  expected = parse_sha256(out.stdout)
+                  if expected:
+                      print("keystore 里的签名证书 SHA-256:", expected)
+                  else:
+                      fail("读不出 keystore 的签名证书指纹（keytool -list -v 解析失败）")
+          else:
+              print("::warning::本次没有配置签名 secrets（APK 用 debug 签名），跳过签名指纹比对")
+
+          apks = []
+          for abi in ABIS:
+              path = "PiliPlus-BTR-android-%s-btr.%s-%s.apk" % (VERSION, BUILD, abi)
+              if not os.path.exists(path):
+                  fail("%s 不存在" % path)
+                  continue
+              size = os.path.getsize(path)
+              if size < MIN_BYTES:
+                  fail("%s 只有 %d 字节，显然不完整" % (path, size))
+              apks.append((abi, path))
+              with zipfile.ZipFile(path) as archive:
+                  names = archive.namelist()
+                  libs = [n for n in names if n.startswith("lib/%s/" % abi) and n.endswith(".so")]
+                  if not libs:
+                      fail("%s 里没有 lib/%s/*.so，这个 ABI 的包是空的" % (path, abi))
+                  try:
+                      manifest = archive.read("AndroidManifest.xml").replace(b"\x00", b"")
+                  except KeyError:
+                      fail("%s 里没有 AndroidManifest.xml" % path)
+                      manifest = b""
+                  if manifest and APP_ID.encode() not in manifest:
+                      fail("%s 的清单里没有 %s（btr 变体可能没生效，装上去会和官方版撞签名）" % (path, APP_ID))
+                  if manifest and APP_VERSION.encode() not in manifest:
+                      fail("%s 的清单里没有版本名 %s" % (path, APP_VERSION))
+              print("%s：%d 字节，%d 个 %s native 库" % (path, size, len(libs), abi))
+
+          if not apks:
+              fail("没有任何 APK 可以校验")
+          else:
+              signer = apksigner_path()
+              for abi, path in apks:
+                  if signer:
+                      out = run_cmd([signer, "verify", "--print-certs", path])
+                      digest = parse_sha256(out.stdout)
+                      if out.returncode != 0:
+                          fail("%s 签名校验失败（apksigner 退出码 %d）：%s"
+                               % (path, out.returncode, (out.stdout + out.stderr).strip()[:300]))
+                          continue
+                  else:
+                      out = run_cmd(["keytool", "-printcert", "-jarfile", path])
+                      digest = parse_sha256(out.stdout)
+                  if not digest:
+                      fail("%s 读不出签名证书指纹（apksigner 与 keytool 都失败）" % path)
+                      continue
+                  print("%s 签名证书 SHA-256：%s" % (path, digest))
+                  if expected and digest != expected:
+                      fail("%s 的签名证书 %s 与 keystore 的 %s 不一致（很可能静默回退成了 debug 签名）"
+                           % (path, digest, expected))
+
+          if problems:
+              print("")
+              print("APK 校验未通过，共 %d 项：" % len(problems))
+              for problem in problems:
+                  print(" - " + problem)
+              sys.exit(1)
+          print("")
+          print("APK 校验通过")
+          PY
+
       # 这个 artifact 只是备用（release 才是主交付）。注意 upload-artifact 在 archive: false 时
       # 只允许传一个文件，而我们这里有 4 个，所以用默认的打包模式；再挂 continue-on-error，
       # 避免这一步失败时把后面的 release 发布一起拖下水。
@@ -288,3 +447,48 @@ jobs:
             手机一般装 `arm64-v8a`；每个 APK 的 SHA-256 与签名证书指纹记录在 `PiliPlus-BTR-android-build-info.json` 里。
 
             构建来源：`.github/workflows/android-release.yml`（本仓库独立流水线，不影响上游的 IPA 发布）。
+
+  record-failure:
+    name: 失败时开 issue 记录现场
+    needs: [resolve, build]
+    if: ${{ always() && (needs.resolve.result == 'failure' || needs.build.result == 'failure') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: 记录失败（仓库未启用 Issues 时自动跳过）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          UPSTREAM: ${{ needs.resolve.outputs.upstream }}
+          BTR_UPSTREAM: ${{ needs.resolve.outputs.btr_upstream }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RESOLVE_RESULT: ${{ needs.resolve.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+        run: |
+          set -euo pipefail
+
+          # fork 默认关闭 Issues；没启用就直接跳过，别让"记录失败"本身再制造一次失败。
+          if [ "$(gh api "repos/$GITHUB_REPOSITORY" --jq .has_issues)" != "true" ]; then
+            echo "::warning::$GITHUB_REPOSITORY 没有启用 Issues，跳过失败记录（Settings → Features 里勾上 Issues 即可）"
+            exit 0
+          fi
+
+          label="${SHA:0:12}"
+          [ -n "$label" ] || label="run-${GITHUB_RUN_ID}"
+          title="Android APK 发布失败: $label"
+
+          body=$(printf '本次运行失败：resolve=%s build=%s\n\n- 来源提交：`%s`\n- 目标 tag：`%s`\n- 官方 PiliPlus 上游：`%s`\n- BTR 作者上游：`%s`\n- 运行日志：%s\n\n这条流水线只构建 aierlma/PiliPlus 的 btr 提交并发布 APK，不合并上游、不改动 btr 分支与 IPA 发布。\n同一个来源提交的再次失败会追加在本 issue 下，而不是新开一个；排查完直接重跑即可（只有该 tag 已发过 release 需要覆盖时才需要勾 force）。\n' \
+            "$RESOLVE_RESULT" "$BUILD_RESULT" "${SHA:-未取得}" "${TAG:-未取得}" "${UPSTREAM:-未取得}" "${BTR_UPSTREAM:-未取得}" "$RUN_URL")
+
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "in:title \"$title\"" --json number --jq ".[0].number // empty")
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+            echo "已把本次失败追加到 issue #$existing"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
