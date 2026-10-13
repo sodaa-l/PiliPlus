@@ -160,6 +160,18 @@ jobs:
         shell: pwsh
         run: lib/scripts/patch.ps1 android
 
+      # flutter test 会为整条依赖图构建 native assets，而依赖 cnativeapi 的 build hook 在 Linux 上
+      # 要求 pkg-config 能找到 gtk+-3.0 / x11 / xi（macOS 上走别的分支，所以 aierlma 在 macos 上跑
+      # 同样的测试不需要这些）。清单抄自本仓库自己的 Linux CI（linux_x64.yml），只额外补了报错点名的
+      # libx11-dev / libxi-dev。
+      - name: 安装 Linux 原生构建依赖
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev libx11-dev libxi-dev \
+            libayatana-appindicator3-dev webkit2gtk-4.1 libasound2-dev libmpv-dev
+
       # 与 aierlma 那条完全相同的 BTR 测试（同一份代码、同一组文件）。多花 1~3 分钟，换来的
       # 区别是：「发布的这份包通过了 BTR 测试」由本流水线自证，而不是靠相信上游。
       # make_btr_mirror.py 必须先跑：它把 lib/services/btr_proxy/ 镜像到 test/standalone/btr/
@@ -471,7 +483,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          # fork 默认关闭 Issues；没启用就直接跳过，别让"记录失败"本身再制造一次失败。
+          # fork 默认关闭 Issues；没启用就直接跳过，别让记录失败本身再制造一次失败。
           if [ "$(gh api "repos/$GITHUB_REPOSITORY" --jq .has_issues)" != "true" ]; then
             echo "::warning::$GITHUB_REPOSITORY 没有启用 Issues，跳过失败记录（Settings → Features 里勾上 Issues 即可）"
             exit 0
