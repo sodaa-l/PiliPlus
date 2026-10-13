@@ -19,6 +19,12 @@ on:
     # 每天 UTC 12:47（北京时间 20:47）。aierlma 的 iOS 流水线是 UTC 11:17 触发，
     # 留出约 90 分钟让它先把合并后的 btr 分支推上去，这里才不会构建到旧代码。
     - cron: '47 12 * * *'
+  # 只在流水线自身定义变更时触发一次：既能自动验证对本文件的改动，也让人无需 gh CLI 就能跑一次。
+  # 用 paths 限定，所以同步 fork、改业务代码都不会触发。
+  push:
+    branches: [btr]
+    paths:
+      - .github/workflows/android-release.yml
   workflow_dispatch:
     inputs:
       force:
@@ -172,21 +178,65 @@ jobs:
             libgtk-3-dev libx11-dev libxi-dev \
             libayatana-appindicator3-dev webkit2gtk-4.1 libasound2-dev libmpv-dev
 
-      # 与 aierlma 那条完全相同的 BTR 测试（同一份代码、同一组文件）。多花 1~3 分钟，换来的
-      # 区别是：「发布的这份包通过了 BTR 测试」由本流水线自证，而不是靠相信上游。
+      # 与 aierlma 那条完全相同的 BTR 测试（同一份代码、同一组文件）。这是**会阻断发布**的门禁：
+      # 测试不通过就不发 release。
       # make_btr_mirror.py 必须先跑：它把 lib/services/btr_proxy/ 镜像到 test/standalone/btr/
       # 并生成最小桩，下面这 6 个 standalone 测试依赖这些生成物。
+      # 失败时把「失败用例 + 断言」压成一条 ::error:: 注解（换行转义为 %0A），这样无需登录也能在
+      # 运行页面读到根因；完整日志另外作为 artifact 上传。
+      #
+      # ⚠️ 下面这步修正的是**上游测试自身的构造缺陷**，不是放水：
+      # btr_cdn_racer_test.dart 第 4 个用例想造"新最优 1.10 MB/s、未达 1.2× 迟滞"的场景，但它给
+      # mock 的参数是"8 片 × 每片后延迟 7ms"≈ 49ms，算出来是 1.275 MB/s——**已经在 1.2× 阈值之上**，
+      # 所以该用例只在定时器有额外开销（macOS 定时器粒度粗，每片多花约 2ms）时才碰巧通过；
+      # ubuntu 定时器很准，于是实测失败（失败信息正是"现役 existing-cdn 被换成了 127.0.0.1:..."）。
+      # 这里只把延迟 7ms 改成 10ms（≈0.94 MB/s），让它真正产出注释里写的那个场景。
+      # 断言、阈值、被测实现一律未动。上游修好后删掉本步骤即可；补丁打不上时这里会直接失败，
+      # 不会悄悄失效。
+      - name: 修正上游那个自相矛盾的竞速测试参数
+        run: |
+          set -euo pipefail
+          file=test/standalone/btr_cdn_racer_test.dart
+          if ! grep -q 'delayMsPerChunk: 7)' "$file"; then
+            echo "::error::上游测试里找不到 delayMsPerChunk: 7)，可能已被上游改掉，请核对后决定是否保留本补丁"
+            exit 1
+          fi
+          sed -i 's/delayMsPerChunk: 7)/delayMsPerChunk: 10)/' "$file"
+          if grep -q 'delayMsPerChunk: 7)' "$file"; then
+            echo "::error::补丁未生效"
+            exit 1
+          fi
+          grep -n 'delayMsPerChunk: 10)' "$file"
+
       - name: 跑 BTR 测试
         run: |
           set -euo pipefail
-          python3 tool/make_btr_mirror.py
-          flutter test --no-pub \
-            test/utils/storage_pref_test.dart \
-            test/standalone/btr_bitrate_unit_test.dart \
-            test/standalone/btr_cdn_racer_test.dart \
-            test/standalone/btr_round22_test.dart \
-            test/standalone/btr_round23_test.dart \
-            test/standalone/btr_round26_test.dart
+          if { python3 tool/make_btr_mirror.py && flutter test --no-pub \
+                 test/utils/storage_pref_test.dart \
+                 test/standalone/btr_bitrate_unit_test.dart \
+                 test/standalone/btr_cdn_racer_test.dart \
+                 test/standalone/btr_round22_test.dart \
+                 test/standalone/btr_round23_test.dart \
+                 test/standalone/btr_round26_test.dart; } 2>&1 | tee btr-test.log; then
+            echo "BTR 测试全部通过"
+          else
+            detail=$(grep -A 16 -m 3 -e '❌' -e '\[E\]' btr-test.log || true)
+            detail=$(printf '%s' "$detail" | head -n 60)
+            detail=${detail//'%'/'%25'}
+            detail=${detail//$'\r'/''}
+            detail=${detail//$'\n'/'%0A'}
+            echo "::error::BTR 测试未全部通过，失败用例与断言：$detail"
+            exit 1
+          fi
+
+      - name: 失败时上传测试日志
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: btr-test-log
+          path: btr-test.log
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: 写入签名密钥
         id: signing
@@ -418,6 +468,7 @@ jobs:
               print("APK 校验未通过，共 %d 项：" % len(problems))
               for problem in problems:
                   print(" - " + problem)
+                  print("::error::" + problem)
               sys.exit(1)
           print("")
           print("APK 校验通过")
