@@ -209,7 +209,24 @@ jobs:
           ls -l PiliPlus-BTR-android-*.apk
 
           python3 - <<'PY'
-          import hashlib, json, os, pathlib
+          import hashlib, json, os, pathlib, subprocess
+
+
+          def signer_fingerprint(apk):
+              # 从 APK 的 v1 签名块读出签名证书的 SHA-256 指纹，用来确认这份包到底是谁签的。
+              # 任何失败都只记成说明文字，绝不让它中断发布。
+              try:
+                  out = subprocess.run(
+                      ['keytool', '-printcert', '-jarfile', apk],
+                      capture_output=True, text=True, timeout=60).stdout
+              except Exception as error:
+                  return 'unavailable: ' + str(error)
+              for line in out.splitlines():
+                  normalized = line.replace('SHA-256:', 'SHA256:')
+                  if 'SHA256:' in normalized:
+                      return normalized.split('SHA256:', 1)[1].strip().upper()
+              return 'not found'
+
 
           apks = {}
           for path in sorted(pathlib.Path('.').glob('PiliPlus-BTR-android-*.apk')):
@@ -217,6 +234,7 @@ jobs:
               apks[path.name] = {
                   'sha256': hashlib.sha256(data).hexdigest(),
                   'size': len(data),
+                  'signer_sha256': signer_fingerprint(str(path)),
               }
 
           info = {
@@ -234,10 +252,13 @@ jobs:
           print(json.dumps(info, indent=2, ensure_ascii=False))
           PY
 
-      - name: 上传构建产物
+      # 这个 artifact 只是备用（release 才是主交付）。注意 upload-artifact 在 archive: false 时
+      # 只允许传一个文件，而我们这里有 4 个，所以用默认的打包模式；再挂 continue-on-error，
+      # 避免这一步失败时把后面的 release 发布一起拖下水。
+      - name: 上传构建产物（打包成单个 artifact）
+        continue-on-error: true
         uses: actions/upload-artifact@v7
         with:
-          archive: false
           name: BTR-android-apks
           path: |
             PiliPlus-BTR-android-*.apk
@@ -264,6 +285,6 @@ jobs:
             - 签名：${{ steps.signing.outputs.signed == 'true' && '自有 keystore（release 签名）' || 'debug 签名（未配置签名 secrets）' }}
 
             附件为 3 个按 ABI 拆分的 APK（`arm64-v8a` / `armeabi-v7a` / `x86_64`），
-            手机一般装 `arm64-v8a`；每个 APK 的 SHA-256 记录在 `PiliPlus-BTR-android-build-info.json` 里。
+            手机一般装 `arm64-v8a`；每个 APK 的 SHA-256 与签名证书指纹记录在 `PiliPlus-BTR-android-build-info.json` 里。
 
             构建来源：`.github/workflows/android-release.yml`（本仓库独立流水线，不影响上游的 IPA 发布）。
