@@ -1,4 +1,4 @@
-# PiliPlus BTR — sodaa-l（安卓 APK）
+# PiliPlus BTR（安卓 APK）
 
 > 本仓库是 [aierlma/PiliPlus](https://github.com/aierlma/PiliPlus) 的 fork，**只多一条自己的安卓 APK 流水线**：
 > 上游那套「定期合并 BTR 作者与官方 main、再发未签名 IPA」的自动化在 aierlma 的仓库里运行，在这里不运行，也不受本 fork 影响。
@@ -14,9 +14,6 @@
 - **构建**：`.github/workflows/android-release.yml`。每天 UTC 12:47（北京 20:47）跟随 aierlma 的 `btr` 最新提交构建，
   也可在 Actions 页手动 `Run workflow`。构建前会跑与上游相同的 BTR 测试作为**发布门禁**：不过就不发版，
   并自动开一个 issue 记录失败现场。
-- **签名**：自有 keystore（release 签名）。签名证书 SHA-256：
-  `68:AE:C2:C3:71:13:DB:D7:E3:60:77:00:23:EF:53:2C:D2:69:ED:A3:D7:0D:59:FC:DA:44:78:66:68:F9:CD:7E`
-  （可用 `apksigner verify --print-certs <apk>` 核对）。更换 keystore 后旧包无法覆盖安装，只能卸载重装。
 - **更新**：**应用内的「检查更新」对这个 APK 不生效** —— 那条通道只认 aierlma 的 iOS IPA 附件。
   请 Watch 本仓库（Releases only）或手动查看 [Releases](https://github.com/sodaa-l/PiliPlus/releases)。
 - **分支**：流水线文件放在默认分支 `apk-pipeline` 上，这样 `Sync fork` 碰不到它；`btr` 只用于跟随上游。
@@ -74,7 +71,7 @@ flutter build apk --release --split-per-abi \
   --dart-define-from-file=pili_release.json --android-project-arg btr=1 --no-pub
 ```
 
-`--android-project-arg btr=1` 决定包名变体 `com.example.piliplus.btr` 与应用名「PiliPlus BTR」；签名配置见上方「安卓版」一节。
+`--android-project-arg btr=1` 决定包名变体 `com.example.piliplus.btr` 与应用名「PiliPlus BTR」。
 
 ```sh
 python3 -m unittest discover -s tool/tests -v
