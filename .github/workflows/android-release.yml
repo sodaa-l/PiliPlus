@@ -8,7 +8,9 @@
 #
 # 首次使用需要手动做三件事：
 #   1. fork 的 Actions 页点「I understand my workflows, go ahead and enable them」；
-#   2. 想让它每天自动跑，确认本 workflow 处于 Enabled 状态（fork 的 schedule 默认不生效）；
+#   2. 确认本文件待在**默认分支**（`apk-pipeline`）上，且本 workflow 处于 Enabled 状态：
+#      schedule / workflow_dispatch 只认默认分支；把本文件放在 btr 之外，正是为了让 Sync fork
+#      无法把它一起重置掉（btr 只用来跟随上游）；
 #   3. 可选：配置签名 secrets（SIGN_KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD），
 #      不配置则回退为 debug 签名（能装，但签名与自建 release 签名不通用）。
 
@@ -21,8 +23,9 @@ on:
     - cron: '47 12 * * *'
   # 只在流水线自身定义变更时触发一次：既能自动验证对本文件的改动，也让人无需 gh CLI 就能跑一次。
   # 用 paths 限定，所以同步 fork、改业务代码都不会触发。
+  # 分支跟到本文件所在的默认分支 apk-pipeline（见文件头说明）。
   push:
-    branches: [btr]
+    branches: [apk-pipeline]
     paths:
       - .github/workflows/android-release.yml
   workflow_dispatch:
@@ -78,8 +81,9 @@ jobs:
           set -euo pipefail
 
           # 恒定构建 aierlma/PiliPlus 的 btr 最新提交 —— 也就是它那些 IPA 对应的代码。
-          # 不构建 fork 自己的 btr：你往 btr 上提交任何东西（包括本 workflow 文件）都会和上游分叉，
-          # 那样只会一直构建旧代码。想让 fork 的 btr 也跟上，自己去点 Sync fork 即可。
+          # 不构建 fork 自己的 btr：本文件不在 btr 上，也不读 btr 的内容，所以 fork 的 btr 落后或分叉都没有影响。
+          # ⚠️ 不要对 btr 用 Sync fork → Discard commits：那会强制重置该分支、丢掉本地提交。
+          #    要让 btr 跟上上游就用 Merge，或者干脆不动它。
           git fetch --no-tags "$SOURCE_REPO" btr
           target=$(git rev-parse FETCH_HEAD)
 
