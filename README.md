@@ -1,12 +1,38 @@
-# PiliPlus BTR — aierlma
+# PiliPlus BTR — sodaa-l（安卓 APK）
 
-个人维护的 [PiliPlus](https://github.com/bggRGjQaUbCoE/PiliPlus) + BTR 分支，保留 [nishuodedui1145-del/PiliPlus](https://github.com/nishuodedui1145-del/PiliPlus) 的本地 HTTP 代理、多 Range 并发、CDN 选择/竞速、BTR 设置与日志，同时由 GitHub Actions 定期检查并合并 BTR 作者的 `btr` 与 PiliPlus 官方的 `main`。
+> 本仓库是 [aierlma/PiliPlus](https://github.com/aierlma/PiliPlus) 的 fork，**只多一条自己的安卓 APK 流水线**：
+> 上游那套「定期合并 BTR 作者与官方 main、再发未签名 IPA」的自动化在 aierlma 的仓库里运行，在这里不运行，也不受本 fork 影响。
+> 上游的 iOS 包仍由 aierlma 发布：[releases/latest](https://github.com/aierlma/PiliPlus/releases/latest)。
 
-下载自己的[正式未签名 IPA](https://github.com/aierlma/PiliPlus/releases/latest)，通过 [AltGallery](https://github.com/aierlma/AltGallery) 更新。BTR 开关默认关闭，在「我的 → 设置 → 音视频设置」开启；播放页的「更多 → BTR」提供快设与日志。应用内更新检查也指向本仓库。
+## 安卓版（本仓库的产物）
+
+- **下载**：[Releases](https://github.com/sodaa-l/PiliPlus/releases) 的附件。每次产出 3 个按 ABI 拆分的 APK
+  （`arm64-v8a` / `armeabi-v7a` / `x86_64`），手机一般装 `arm64-v8a`；每个包的 SHA-256、大小与签名证书指纹
+  记录在同一次 release 的 `PiliPlus-BTR-android-build-info.json` 里。
+- **包标识**：`com.example.piliplus.btr`，应用名「PiliPlus BTR」，可与官方 PiliPlus 共存安装。
+- **内容**：与同期 aierlma 的 iOS 包构建自**同一个来源提交**，含本地 HTTP 代理、多 Range 并发、CDN 选择/竞速等 BTR 功能。
+- **构建**：`.github/workflows/android-release.yml`。每天 UTC 12:47（北京 20:47）跟随 aierlma 的 `btr` 最新提交构建，
+  也可在 Actions 页手动 `Run workflow`。构建前会跑与上游相同的 BTR 测试作为**发布门禁**：不过就不发版，
+  并自动开一个 issue 记录失败现场。
+- **签名**：自有 keystore（release 签名）。签名证书 SHA-256：
+  `68:AE:C2:C3:71:13:DB:D7:E3:60:77:00:23:EF:53:2C:D2:69:ED:A3:D7:0D:59:FC:DA:44:78:66:68:F9:CD:7E`
+  （可用 `apksigner verify --print-certs <apk>` 核对）。更换 keystore 后旧包无法覆盖安装，只能卸载重装。
+- **更新**：**应用内的「检查更新」对这个 APK 不生效** —— 那条通道只认 aierlma 的 iOS IPA 附件。
+  请 Watch 本仓库（Releases only）或手动查看 [Releases](https://github.com/sodaa-l/PiliPlus/releases)。
+- **分支**：流水线文件放在默认分支 `apk-pipeline` 上，这样 `Sync fork` 碰不到它；`btr` 只用于跟随上游。
+  ⚠️ 不要对 `btr` 使用 `Sync fork → Discard commits`（会强制重置该分支）；要同步就用 Merge，或者干脆不动它。
+
+## 上游 aierlma 的说明
+
+> 以下内容来自上游 README，描述的是 **aierlma 仓库**的 iOS 流水线，在本 fork 不运行，保留备查。
+
+上游个人维护的 [PiliPlus](https://github.com/bggRGjQaUbCoE/PiliPlus) + BTR 分支，保留 [nishuodedui1145-del/PiliPlus](https://github.com/nishuodedui1145-del/PiliPlus) 的本地 HTTP 代理、多 Range 并发、CDN 选择/竞速、BTR 设置与日志，同时由 GitHub Actions 定期检查并合并 BTR 作者的 `btr` 与 PiliPlus 官方的 `main`。
+
+上游发布[正式未签名 IPA](https://github.com/aierlma/PiliPlus/releases/latest)，通过 [AltGallery](https://github.com/aierlma/AltGallery) 更新。BTR 开关默认关闭，在「我的 → 设置 → 音视频设置」开启；播放页的「更多 → BTR」提供快设与日志。上游 iOS 版的应用内更新检查指向 aierlma 的仓库。
 
 ## 同步与发布
 
-默认分支为 `btr`。`BTR and PiliPlus sync and iOS release` 在 GitHub 每天检查一次（cron `17 11 * * *`，纽约夏令时 07:17、冬令时 06:17），也可从 Actions 手动运行。GitHub 计划任务可能延迟；每次检查当前最新提交，不积压逐个版本构建。
+上游仓库的默认分支为 `btr`。`BTR and PiliPlus sync and iOS release` 在 GitHub 每天检查一次（cron `17 11 * * *`，纽约夏令时 07:17、冬令时 06:17），也可从 Actions 手动运行。GitHub 计划任务可能延迟；每次检查当前最新提交，不积压逐个版本构建。
 
 1. Ubuntu 分别检查 BTR 作者 `nishuodedui1145-del/PiliPlus/btr`、PiliPlus 官方 `bggRGjQaUbCoE/PiliPlus/main` 和当前个人分支的 SHA，并与最近正式 IPA 对应的源码比较。两种更新都已纳入且应用输入没有变化时直接结束；个人分支的每一个维护提交无需另有 release。任何一个来源有新提交，都独立触发候选合并，无需等待另一方更新。
 2. macOS 先普通合并 BTR 作者的新提交，再普通合并官方新提交。BTR 作者落后于官方时，只合并其新增历史，不把新版官方代码覆盖回旧版。任一来源冲突会回滚整个临时候选；个人 README 和 `.github/workflows/` 保留个人配置，两个来源的 README 分别保存为 `README-BTR-upstream.md` 和 `README-upstream.md`。
@@ -38,6 +64,17 @@
 Flutter 版本由官方 `pubspec.yaml` 固定，SDK 与 UI 包需要 `lib/scripts/patch.ps1 iOS` 的补丁。标准 macOS GitHub runner 构建，不需要 Apple 签名凭据；产物需自行侧载。
 
 本地构建个人正式 iOS 包时运行 `pwsh lib/scripts/build.ps1 btr-ios`，应用同样的 iOS 版本写入；其他平台沿用原版本生成方式。
+
+本 fork 的安卓包在本地按同样方式复现（都是仓库内置脚本，无需改代码）：
+
+```sh
+pwsh lib/scripts/patch.ps1 android   # 打 Flutter SDK / material_ui 补丁，含 flutter pub get
+pwsh lib/scripts/build.ps1 android   # 写版本号（安卓会拼上 commit 短哈希）并生成 pili_release.json
+flutter build apk --release --split-per-abi \
+  --dart-define-from-file=pili_release.json --android-project-arg btr=1 --no-pub
+```
+
+`--android-project-arg btr=1` 决定包名变体 `com.example.piliplus.btr` 与应用名「PiliPlus BTR」；签名配置见上方「安卓版」一节。
 
 ```sh
 python3 -m unittest discover -s tool/tests -v
