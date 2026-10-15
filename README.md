@@ -9,13 +9,18 @@
 - **下载**：[Releases](https://github.com/sodaa-l/PiliPlus/releases) 的附件。每次产出 3 个按 ABI 拆分的 APK
   （`arm64-v8a` / `armeabi-v7a` / `x86_64`），手机一般装 `arm64-v8a`；每个包的 SHA-256、大小与签名证书指纹
   记录在同一次 release 的 `PiliPlus-BTR-android-build-info.json` 里。
+- **正式版与预览版**：只有上游 `pubspec.yaml` 里的版本号变了（如 `2.1.6` → `2.1.7`）时发的才是**正式 release**；
+  同一个版本号下的后续跟随构建都标为 **Pre-release**（滚动预览版）。所以 [releases/latest](https://github.com/sodaa-l/PiliPlus/releases/latest)
+  与 Releases 页的「Latest」标记只在版本号变更时前进，可能比最新一次构建旧；想装最新的滚动构建就进
+  [Releases](https://github.com/sodaa-l/PiliPlus/releases) 挑时间最新的那个（两类包签名相同、构建号递增，可直接覆盖安装）。
 - **包标识**：`com.example.piliplus.btr`，应用名「PiliPlus BTR」，可与官方 PiliPlus 共存安装。
 - **内容**：与同期 aierlma 的 iOS 包构建自**同一个来源提交**，含本地 HTTP 代理、多 Range 并发、CDN 选择/竞速等 BTR 功能。
 - **构建**：`.github/workflows/android-release.yml`。每天 UTC 12:47（北京 20:47）跟随 aierlma 的 `btr` 最新提交构建，
   也可在 Actions 页手动 `Run workflow`。构建前会跑与上游相同的 BTR 测试作为**发布门禁**：不过就不发版，
   并自动开一个 issue 记录失败现场。
 - **更新**：**应用内的「检查更新」对这个 APK 不生效** —— 那条通道只认 aierlma 的 iOS IPA 附件。
-  请 Watch 本仓库（Releases only）或手动查看 [Releases](https://github.com/sodaa-l/PiliPlus/releases)。
+  请 Watch 本仓库（Releases only）或手动查看 [Releases](https://github.com/sodaa-l/PiliPlus/releases)；
+  Releases 列表里带 **Pre-release** 标记的是同版本号的滚动构建，没有标记的才是版本变更的正式版。
 - **分支**：流水线文件放在默认分支 `apk-pipeline` 上，这样 `Sync fork` 碰不到它；`btr` 只用于跟随上游。
   ⚠️ 不要对 `btr` 使用 `Sync fork → Discard commits`（会强制重置该分支）；要同步就用 Merge，或者干脆不动它。
 
