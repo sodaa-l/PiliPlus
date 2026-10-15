@@ -18,6 +18,17 @@
 #   因此**不设回切方案**：即便 Watch → Releases only 收不到 pre-release 通知，也符合预期（不稳定构建
 #   不该当成 release 推给用户），不要改成 make_latest: false。用户端在版本号不变期间安静是正常的。
 #
+# 应用内更新（本 fork 的 APK）：
+#   应用里的「检查更新」（lib/utils/update.dart 的非 iOS 分支）原生读的是 aierlma 的
+#   /releases，且用 release 的 created_at 与构建时写入的 pili.time 比较 —— 对我们这个 fork
+#   既会弹上游、又必然假报（created_at 总比 pili.time 晚，装完第一次检查就提示「当前这一版」）。
+#   所以构建前打一个补丁（见「把应用内更新检查指向本 fork」步骤）：把 latestApp / sourceCodeUrl
+#   指向本仓库，并把判据换成「本仓库最新**正式版**的构建号 > 自身 versionCode」。只认正式版 →
+#   同版本号的滚动构建（pre-release）不会提示，与上面的发布语义一致。
+#   补丁是精确匹配，上游改过那几行就会构建失败提醒重写补丁，不会静默失效。
+#   「应用内下载+安装」（REQUEST_INSTALL_PACKAGES + FileProvider + 原生 Intent）已评估且决定
+#   不做：要动原生层、本机又没有 Android SDK 无法编译验证，性价比不划算，保持浏览器直链。
+#
 # 首次使用需要手动做三件事：
 #   1. fork 的 Actions 页点「I understand my workflows, go ahead and enable them」；
 #   2. 确认本文件待在**默认分支**（`apk-pipeline`）上，且本 workflow 处于 Enabled 状态：
@@ -200,6 +211,159 @@ jobs:
       - name: 打 Flutter SDK 与 material_ui 补丁（含 flutter pub get）
         shell: pwsh
         run: lib/scripts/patch.ps1 android
+
+      # 见文件头「应用内更新」：应用内检查更新原生指向 aierlma 的 release，而且判据（release 的
+      # created_at 比构建时写入的 pili.time）对我们这个 fork 必然假报，所以构建前改成：
+      #   ① latestApp / sourceCodeUrl 指向本仓库；② 判据改成按「最新正式版的构建号」比较。
+      # 顺带往 update.dart 里加一个解析 Android 发布契约的 BtrAndroidRelease（对应 iOS 的 BtrIosRelease）。
+      # 三处替换都要求精确匹配：上游改过就 exit 1，绝不静默失效（与上面修竞速测试参数那步同一风格）。
+      - name: 把应用内更新检查指向本 fork
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib
+          import sys
+
+          REPO = 'sodaa-l/PiliPlus'
+
+
+          def patch(path, old, new, expect=1):
+              file = pathlib.Path(path)
+              text = file.read_text(encoding='utf-8')
+              found = text.count(old)
+              if found != expect:
+                  print('::error::%s 里匹配到 %d 处（期望 %d 处），上游可能改过这段，'
+                        '请核对后再决定保留还是删除本补丁' % (path, found, expect))
+                  sys.exit(1)
+              file.write_text(text.replace(old, new), encoding='utf-8')
+              print('%s：替换 %d 处' % (path, found))
+
+
+          def replace_block(path, old_lines, new_lines):
+              # 按「去掉首尾空白后的整行内容」匹配连续若干行，替换后沿用原缩进，
+              # 这样本补丁里写的 Dart 片段不必跟着文件的缩进走。
+              file = pathlib.Path(path)
+              lines = file.read_text(encoding='utf-8').split('\n')
+              expected = [line.strip() for line in old_lines]
+              for start in range(len(lines) - len(expected) + 1):
+                  if [line.strip() for line in lines[start:start + len(expected)]] == expected:
+                      head = lines[start]
+                      indent = head[:len(head) - len(head.lstrip())]
+                      lines[start:start + len(expected)] = [
+                          indent + line if line else '' for line in new_lines
+                      ]
+                      file.write_text('\n'.join(lines), encoding='utf-8')
+                      print('%s：第 %d 行起，%d 行 -> %d 行'
+                            % (path, start + 1, len(expected), len(new_lines)))
+                      return
+              print('::error::%s 里找不到预期的那 %d 行，上游可能改过这段，'
+                    '请核对后再决定保留还是删除本补丁' % (path, len(expected)))
+              sys.exit(1)
+
+
+          OLD_BRANCH = '''
+          data = Map<String, dynamic>.from(res.data[0] as Map);
+          final latest =
+          DateTime.parse(data['created_at']).millisecondsSinceEpoch ~/ 1000;
+          hasUpdate = BuildConfig.buildTime < latest;
+          '''.strip('\n').split('\n')
+
+          NEW_BRANCH = '''
+          // 本 fork 的 Android 包：只认本仓库的**正式版**（同版本号的滚动重建是 pre-release，
+          // 按发布语义不算发版），并以 tag 里的构建号与自身 versionCode 比较。
+          // 不能用 release 的 created_at 比：它比构建时写入的 pili.time 晚，
+          // 装完第一次检查就会假报「当前这一版」有新版本。
+          final releases = <BtrAndroidRelease>[];
+          if (res.data is List) {
+            for (final item in res.data as List) {
+              final release = BtrAndroidRelease.parse(item);
+              if (release != null) releases.add(release);
+            }
+          }
+          releases.sort((a, b) => b.build.compareTo(a.build));
+          if (releases.isEmpty || releases.first.build <= BuildConfig.versionCode) {
+            if (!isAuto) {
+              SmartDialog.showToast('已是最新版本');
+            }
+            return;
+          }
+          data = releases.first.data;
+          hasUpdate = true;
+          '''.strip('\n').split('\n')
+
+          ANDROID_RELEASE_CLASS = r'''
+
+          /// 本 fork 的 Android 正式版（对应 iOS 那边的 BtrIosRelease），只接受 prerelease == false：
+          /// tag 形如 `v<版本>-btr.<构建号>-<sha12>-android`，附件是按 ABI 拆分的
+          /// `PiliPlus-BTR-android-<版本>-btr.<构建号>-<abi>.apk`。
+          final class BtrAndroidRelease {
+            BtrAndroidRelease._(this.data, this.version, this.build);
+
+            final Map<String, dynamic> data;
+            final String version;
+            final int build;
+
+            static final _tagPattern = RegExp(
+              r'^v(\d+\.\d+\.\d+)-btr\.([1-9]\d*)-[0-9a-f]{12}-android$',
+            );
+
+            static BtrAndroidRelease? parse(dynamic data) {
+              if (data is! Map) return null;
+              final json = Map<String, dynamic>.from(data);
+              if (json['draft'] != false || json['prerelease'] != false) return null;
+              final tag = json['tag_name'];
+              if (tag is! String) return null;
+              final match = _tagPattern.firstMatch(tag);
+              if (match == null) return null;
+              final build = int.tryParse(match[2]!);
+              if (build == null) return null;
+              final prefix = 'PiliPlus-BTR-android-${match[1]}-btr.$build-';
+              final assets = json['assets'];
+              if (assets is! List ||
+                  !assets.any(
+                    (asset) =>
+                        asset is Map &&
+                        asset['state'] == 'uploaded' &&
+                        asset['name'] is String &&
+                        (asset['name'] as String).startsWith(prefix) &&
+                        (asset['name'] as String).endsWith('.apk'),
+                  )) {
+                return null;
+              }
+              return BtrAndroidRelease._(json, match[1]!, build);
+            }
+          }
+          '''
+
+          # ① 更新检查读的 releases 列表 → 本仓库
+          patch(
+              'lib/http/api.dart',
+              'https://api.github.com/repos/aierlma/PiliPlus/releases',
+              'https://api.github.com/repos/%s/releases' % REPO,
+          )
+
+          # ② 弹窗里「点此查看完整更新(即commit)内容」与下载兜底链接 → 本仓库
+          patch(
+              'lib/common/constants.dart',
+              "  static const sourceCodeUrl = 'https://github.com/aierlma/PiliPlus';",
+              "  static const sourceCodeUrl = 'https://github.com/%s';" % REPO,
+          )
+
+          # ③ 非 iOS 分支的判据 → 最新正式版的构建号 > 自身 versionCode
+          replace_block('lib/utils/update.dart', OLD_BRANCH, NEW_BRANCH)
+
+          # ④ 带上解析 Android 发布契约的类
+          target = pathlib.Path('lib/utils/update.dart')
+          text = target.read_text(encoding='utf-8')
+          if 'BtrAndroidRelease' in text:
+              print('::error::update.dart 里已经出现 BtrAndroidRelease，补丁可能被重复应用')
+              sys.exit(1)
+          target.write_text(text.rstrip('\n') + '\n' + ANDROID_RELEASE_CLASS,
+                            encoding='utf-8')
+          print('lib/utils/update.dart：已追加 BtrAndroidRelease')
+          PY
+          # 纯语法解析检查（只看能不能解析，不管格式），把写错 Dart 的代价从「构建十几分钟后失败」降到几秒。
+          dart format --output=none lib/utils/update.dart
 
       # flutter test 会为整条依赖图构建 native assets，而依赖 cnativeapi 的 build hook 在 Linux 上
       # 要求 pkg-config 能找到 gtk+-3.0 / x11 / xi（macOS 上走别的分支，所以 aierlma 在 macos 上跑
