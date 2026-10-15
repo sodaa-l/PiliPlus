@@ -6,6 +6,16 @@
 #   构建 aierlma/PiliPlus 的 btr 最新提交 → 产出 3 个 ABI 拆分的 release APK → 打自己的 tag 发 release。
 #   它不读也不改你 fork 的 btr 内容，只借一个专用分支 btr-android-build 寄存构建用的提交。
 #
+# 发布语义（正式版 / 预览版）：
+#   判定基准是**本仓库最新正式版的版本号**（REST 里 /releases/latest 的定义就是「最近的非 draft、
+#   非预发布 release」，所以它天然给出上一次发正式版时的版本号）：
+#   本次构建的 version 与它不同 → 正式 release（会成为 Latest）；相同 → 同版本滚动重建，发 pre-release
+#   （pre-release 不会被设成 Latest，因此不需要 make_latest）。即「只有上游 pubspec.yaml 的版本号变了，
+#   Latest 才前进」。每个版本号的第一份构建成功的包就是它的正式版；版本号变更的那个提交若构建失败，
+#   后面同版本的成功构建会补上正式版。仓库还没有正式 release 时按正式版发布。
+#   回切方案（既定后手）：若实测 Watch → Releases only 收不到 pre-release 通知，就把 prerelease 固定为
+#   false、改为只给同版本重建传 make_latest: false —— Latest 同样只在版本变更时前进，而通知一定正常。
+#
 # 首次使用需要手动做三件事：
 #   1. fork 的 Actions 页点「I understand my workflows, go ahead and enable them」；
 #   2. 确认本文件待在**默认分支**（`apk-pipeline`）上，且本 workflow 处于 Enabled 状态：
@@ -63,6 +73,7 @@ jobs:
       version: ${{ steps.target.outputs.version }}
       build: ${{ steps.target.outputs.build }}
       tag: ${{ steps.target.outputs.tag }}
+      prerelease: ${{ steps.target.outputs.prerelease }}
       upstream: ${{ steps.target.outputs.upstream }}
       btr_upstream: ${{ steps.target.outputs.btr_upstream }}
     steps:
@@ -100,6 +111,23 @@ jobs:
           build=$(git rev-list --count "$target")
           tag="v${version}-btr.${build}-${target:0:12}-android"
 
+          # 正式版 / 预览版判定：基准是**本仓库最新正式版的版本号**（REST 里 /releases/latest 的定义就是
+          # 「最近的非 draft、非预发布 release」，所以它天然给出上一次发正式版时的版本号）。
+          # 本次 version 与它不同 → 正式 release；相同 → 同版本滚动重建，发 pre-release。
+          # 仓库还没有正式版（该请求 404）或 API 临时失败时按正式版发布并告警，不静默改语义。
+          latest_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name 2>/dev/null || true)
+          latest_version=${latest_tag#v}
+          latest_version=${latest_version%%-btr.*}
+          if [ -z "$latest_version" ]; then
+            echo "::warning::读不到本仓库的最新正式版（可能还没有正式 release，或 API 临时失败）；本次按正式版发布"
+            prerelease=false
+          elif [ "$version" != "$latest_version" ]; then
+            prerelease=false
+          else
+            prerelease=true
+          fi
+          echo "最新正式版版本号：${latest_version:-无}，本次 version=$version → prerelease=$prerelease"
+
           # 同一个来源提交已经发过就直接跳过，省掉一次 30 分钟以上的构建。
           skip=false
           if [ "$FORCE" != "true" ] && gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -112,6 +140,7 @@ jobs:
             echo "version=$version"
             echo "build=$build"
             echo "tag=$tag"
+            echo "prerelease=$prerelease"
             echo "upstream=$upstream"
             echo "btr_upstream=$btr_upstream"
             echo "skip=$skip"
@@ -495,6 +524,10 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.resolve.outputs.tag }}
+          # true = 同版本号的滚动重建（pre-release），false = 版本号变更的正式版。
+          # action 文档明确「Drafts and prereleases cannot be set as latest」，所以 pre-release 不会抢
+          # Latest，不需要 make_latest。判定逻辑见 resolve job 与文件头的「发布语义」。
+          prerelease: ${{ needs.resolve.outputs.prerelease }}
           target_commitish: ${{ needs.resolve.outputs.sha }}
           name: PiliPlus BTR Android ${{ needs.resolve.outputs.version }} (build ${{ needs.resolve.outputs.build }})
           files: |
