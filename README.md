@@ -18,9 +18,10 @@
 - **构建**：`.github/workflows/android-release.yml`。每天 UTC 12:47（北京 20:47）跟随 aierlma 的 `btr` 最新提交构建，
   也可在 Actions 页手动 `Run workflow`。构建前会跑与上游相同的 BTR 测试作为**发布门禁**：不过就不发版，
   并自动开一个 issue 记录失败现场。
-- **更新**：**应用内的「检查更新」对这个 APK 不生效** —— 那条通道只认 aierlma 的 iOS IPA 附件。
-  请 Watch 本仓库（Releases only）或手动查看 [Releases](https://github.com/sodaa-l/PiliPlus/releases)；
-  Releases 列表里带 **Pre-release** 标记的是同版本号的滚动构建，没有标记的才是版本变更的正式版。
+- **更新**：应用内的「检查更新」已经指向**本仓库**，但只认上面的**正式版** —— 只有上游版本号变化、发了新的正式
+  release 时才提示，同版本号的滚动构建（Pre-release）不会打扰。弹窗里的下载按钮会用浏览器打开对应 ABI 的
+  APK 直链（需要系统允许浏览器安装未知应用）。想跟最新的滚动构建，请 Watch 本仓库（Releases only）或手动
+  查看 [Releases](https://github.com/sodaa-l/PiliPlus/releases)。
 - **分支**：流水线文件放在默认分支 `apk-pipeline` 上，这样 `Sync fork` 碰不到它；`btr` 只用于跟随上游。
   ⚠️ 不要对 `btr` 使用 `Sync fork → Discard commits`（会强制重置该分支）；要同步就用 Merge，或者干脆不动它。
 
