@@ -13,8 +13,10 @@
 #   （pre-release 不会被设成 Latest，因此不需要 make_latest）。即「只有上游 pubspec.yaml 的版本号变了，
 #   Latest 才前进」。每个版本号的第一份构建成功的包就是它的正式版；版本号变更的那个提交若构建失败，
 #   后面同版本的成功构建会补上正式版。仓库还没有正式 release 时按正式版发布。
-#   回切方案（既定后手）：若实测 Watch → Releases only 收不到 pre-release 通知，就把 prerelease 固定为
-#   false、改为只给同版本重建传 make_latest: false —— Latest 同样只在版本变更时前进，而通知一定正常。
+#   理由：这条流水线的产物是基于上游 main 的每日滚动构建，本身就不稳定，**本来就不该算 release**；
+#   只有 pubspec.yaml 的版本号刷新才代表「发了一版」，那一次才配得上正式 release 与 Latest。
+#   因此**不设回切方案**：即便 Watch → Releases only 收不到 pre-release 通知，也符合预期（不稳定构建
+#   不该当成 release 推给用户），不要改成 make_latest: false。用户端在版本号不变期间安静是正常的。
 #
 # 首次使用需要手动做三件事：
 #   1. fork 的 Actions 页点「I understand my workflows, go ahead and enable them」；
