@@ -217,6 +217,7 @@ jobs:
       #   ① latestApp / sourceCodeUrl 指向本仓库；② 判据改成按「最新正式版的构建号」比较。
       # 顺带往 update.dart 里加一个解析 Android 发布契约的 BtrAndroidRelease（对应 iOS 的 BtrIosRelease）。
       # 三处替换都要求精确匹配：上游改过就 exit 1，绝不静默失效（与上面修竞速测试参数那步同一风格）。
+      # 本步骤已在本地用真实文件当夹具空跑验证过（含 dart format 的语法解析检查）。
       - name: 把应用内更新检查指向本 fork
         run: |
           set -euo pipefail
@@ -353,10 +354,11 @@ jobs:
           replace_block('lib/utils/update.dart', OLD_BRANCH, NEW_BRANCH)
 
           # ④ 带上解析 Android 发布契约的类
+          # 注意判据要认准「class 定义」那一行：③ 替换进去的分支里本身就有 BtrAndroidRelease 字样。
           target = pathlib.Path('lib/utils/update.dart')
           text = target.read_text(encoding='utf-8')
-          if 'BtrAndroidRelease' in text:
-              print('::error::update.dart 里已经出现 BtrAndroidRelease，补丁可能被重复应用')
+          if 'final class BtrAndroidRelease' in text:
+              print('::error::update.dart 里已经存在 BtrAndroidRelease 定义，补丁可能被重复应用')
               sys.exit(1)
           target.write_text(text.rstrip('\n') + '\n' + ANDROID_RELEASE_CLASS,
                             encoding='utf-8')
