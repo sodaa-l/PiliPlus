@@ -29,12 +29,18 @@
 #   「应用内下载+安装」（REQUEST_INSTALL_PACKAGES + FileProvider + 原生 Intent）已评估且决定
 #   不做：要动原生层、本机又没有 Android SDK 无法编译验证，性价比不划算，保持浏览器直链。
 #
-# 首次使用需要手动做三件事：
+# 首次使用需要手动做四件事：
 #   1. fork 的 Actions 页点「I understand my workflows, go ahead and enable them」；
 #   2. 确认本文件待在**默认分支**（`apk-pipeline`）上，且本 workflow 处于 Enabled 状态：
 #      schedule / workflow_dispatch 只认默认分支；把本文件放在 btr 之外，正是为了让 Sync fork
 #      无法把它一起重置掉（btr 只用来跟随上游）；
-#   3. 可选：配置签名 secrets（SIGN_KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD），
+#   3. 配置 staging 用的 SSH deploy key（**必须**，否则构建永远在「寄存构建提交」这一步失败）：
+#      `ssh-keygen -t ed25519 -N "" -C btr-android-stage -f deploy_key` 生成一对密钥，
+#      把 deploy_key.pub 以 **Allow write access** 加到本仓库 Settings → Deploy keys，
+#      再把私钥整个文件内容存进 Actions secret `BTR_STAGE_SSH_KEY`：
+#      `gh repo deploy-key add deploy_key.pub --allow-write -R <owner>/<repo>`
+#      `gh secret set BTR_STAGE_SSH_KEY -R <owner>/<repo> < deploy_key`
+#   4. 可选：配置签名 secrets（SIGN_KEYSTORE_BASE64 / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD），
 #      不配置则回退为 debug 签名（能装，但签名与自建 release 签名不通用）。
 
 name: BTR Android APK release
@@ -159,9 +165,67 @@ jobs:
             echo "skip=$skip"
           } >> "$GITHUB_OUTPUT"
 
+  # 把构建用的目标提交寄存到专用分支 btr-android-build。
+  #
+  # 为什么单独一个 job、并且必须用 deploy key 而不能用 GITHUB_TOKEN：
+  #   GitHub 禁止安装令牌（GITHUB_TOKEN）创建或更新「包含 .github/workflows/ 改动」的 ref，
+  #   即使该 ref 只是一个分支、推送本身是快进。报错原文：
+  #     ! [remote rejected] <sha> -> btr-android-build
+  #       (refusing to allow a GitHub App to create or update workflow
+  #        `.github/workflows/xxx.yml` without `workflows` permission)
+  #   `permissions:` 里**没有** workflows 这个键（写上去会让整个 workflow 文件校验失败：
+  #   `Unexpected value 'workflows'`），GITHUB_TOKEN 也永远拿不到该权限 —— 这是设计如此。
+  #   而 release 的 tag 必须指向本仓库里真实存在的提交，所以这次寄存躲不掉。
+  #   解法：SSH deploy key 是密钥而不是 GitHub App / OAuth 令牌，不受该守卫限制；
+  #   且它只对本仓库有写权限，比给一个仓库全部权限的 PAT 安全。
+  #
+  # 为什么独立成 job 而不是塞回 build：本 job 刻意**不 checkout、不执行任何上游代码**，
+  # 只搬 git 对象，因此持有一把写权限密钥也无从被上游脚本利用。
+  stage:
+    name: 寄存构建提交
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      # 用 SSH 推送，不需要 contents: write；保持最小权限。
+      contents: read
+    steps:
+      - name: 用 deploy key 把目标提交寄存到 btr-android-build
+        env:
+          TARGET: ${{ needs.resolve.outputs.sha }}
+          SSH_KEY: ${{ secrets.BTR_STAGE_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SSH_KEY:-}" ]; then
+            echo "::error::缺少 secret BTR_STAGE_SSH_KEY（见文件头「首次使用」第 3 条）"
+            exit 1
+          fi
+
+          keyfile="$RUNNER_TEMP/deploy_key"
+          printf '%s\n' "${SSH_KEY%$'\n'}" > "$keyfile"
+          chmod 600 "$keyfile"
+          export GIT_SSH_COMMAND="ssh -i $keyfile -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+
+          # 空 bare 库：只要对象，不要工作区，也就不会碰到任何上游文件。
+          work="$RUNNER_TEMP/stage.git"
+          git init --bare -q "$work"
+
+          # 全量取 btr。不能用 --depth=1 / 部分克隆，否则仓库是 shallow 的，
+          # 推给远端会被拒（`shallow update not allowed`）—— 实测确认过。
+          git -C "$work" fetch --no-tags "$SOURCE_REPO" btr
+          if ! git -C "$work" cat-file -e "${TARGET}^{commit}" 2>/dev/null; then
+            echo "::error::无法取得目标提交 $TARGET"
+            exit 1
+          fi
+
+          # 非强制推送：aierlma 的 btr 只会往前走，所以正常情况是快进；重复运行同一提交时是 no-op。
+          git -C "$work" push "git@github.com:${GITHUB_REPOSITORY}.git" \
+            "${TARGET}:refs/heads/btr-android-build"
+
   build:
     name: 构建 APK 并发布 release
-    needs: resolve
+    needs: [resolve, stage]
     if: needs.resolve.outputs.skip != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -174,9 +238,9 @@ jobs:
           fetch-depth: 0
 
       # build job 是全新的 runner，fork 里可能还没有 aierlma 那条流水线新推的提交，所以先取到目标提交。
-      # release 的 tag 必须指向 fork 里真实存在的提交，所以把它寄存到专用分支 btr-android-build 上，
-      # 完全不动你的 btr 分支。aierlma 的 btr 只会往前走，因此这是一条非强制的快进推送。
-      - name: 取出目标提交并落到专用分支
+      # 真正把提交寄存到 btr-android-build 的工作已由上一个 stage job 完成（它持有 deploy key），
+      # 这里只做只读的 fetch + checkout，build job 不再需要也不能做任何推送到仓库的操作。
+      - name: 取出目标提交并切到该提交
         env:
           TARGET: ${{ needs.resolve.outputs.sha }}
         run: |
@@ -188,7 +252,6 @@ jobs:
             echo "::error::无法取得目标提交 $TARGET"
             exit 1
           fi
-          git push origin "${TARGET}:refs/heads/btr-android-build"
           git checkout --detach "$TARGET"
 
       - name: 构建 Java 环境
@@ -718,8 +781,8 @@ jobs:
 
   record-failure:
     name: 失败时开 issue 记录现场
-    needs: [resolve, build]
-    if: ${{ always() && (needs.resolve.result == 'failure' || needs.build.result == 'failure') }}
+    needs: [resolve, stage, build]
+    if: ${{ always() && (needs.resolve.result == 'failure' || needs.stage.result == 'failure' || needs.build.result == 'failure') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -735,6 +798,7 @@ jobs:
           BTR_UPSTREAM: ${{ needs.resolve.outputs.btr_upstream }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           RESOLVE_RESULT: ${{ needs.resolve.result }}
+          STAGE_RESULT: ${{ needs.stage.result }}
           BUILD_RESULT: ${{ needs.build.result }}
         run: |
           set -euo pipefail
@@ -749,8 +813,8 @@ jobs:
           [ -n "$label" ] || label="run-${GITHUB_RUN_ID}"
           title="Android APK 发布失败: $label"
 
-          body=$(printf '本次运行失败：resolve=%s build=%s\n\n- 来源提交：`%s`\n- 目标 tag：`%s`\n- 官方 PiliPlus 上游：`%s`\n- BTR 作者上游：`%s`\n- 运行日志：%s\n\n这条流水线只构建 aierlma/PiliPlus 的 btr 提交并发布 APK，不合并上游、不改动 btr 分支与 IPA 发布。\n同一个来源提交的再次失败会追加在本 issue 下，而不是新开一个；排查完直接重跑即可（只有该 tag 已发过 release 需要覆盖时才需要勾 force）。\n' \
-            "$RESOLVE_RESULT" "$BUILD_RESULT" "${SHA:-未取得}" "${TAG:-未取得}" "${UPSTREAM:-未取得}" "${BTR_UPSTREAM:-未取得}" "$RUN_URL")
+          body=$(printf '本次运行失败：resolve=%s stage=%s build=%s\n\n- 来源提交：`%s`\n- 目标 tag：`%s`\n- 官方 PiliPlus 上游：`%s`\n- BTR 作者上游：`%s`\n- 运行日志：%s\n\n这条流水线只构建 aierlma/PiliPlus 的 btr 提交并发布 APK，不合并上游、不改动 btr 分支与 IPA 发布。\n同一个来源提交的再次失败会追加在本 issue 下，而不是新开一个；排查完直接重跑即可（只有该 tag 已发过 release 需要覆盖时才需要勾 force）。\n' \
+            "$RESOLVE_RESULT" "$STAGE_RESULT" "$BUILD_RESULT" "${SHA:-未取得}" "${TAG:-未取得}" "${UPSTREAM:-未取得}" "${BTR_UPSTREAM:-未取得}" "$RUN_URL")
 
           existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
             --search "in:title \"$title\"" --json number --jq ".[0].number // empty")
