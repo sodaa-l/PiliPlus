@@ -26,6 +26,14 @@
 #   因此**不设回切方案**：即便 Watch → Releases only 收不到 pre-release 通知，也符合预期（不稳定构建
 #   不该当成 release 推给用户），不要改成 make_latest: false。用户端在版本号不变期间安静是正常的。
 #
+# release note 里的「官方更新内容」：
+#   正式版（即每个官方版本的第一份成功构建）会在 release note **最上方**贴一段该官方版本的更新说明，
+#   内容从官方仓库那个 release 的正文里原样取来，并给出官方 release 链接 —— 这样用户看我们的 release
+#   就知道官方这一版改了什么，不用再跳过去找。
+#   预览版**不贴**：同一官方版本期间的每日重建贴同一份说明，只会变成重复噪音。
+#   取不到官方正文（版本号在官方仓库找不到 tag、网络失败、正文为空）时只写自有说明并打 warning，
+#   这一步带 continue-on-error，**绝不允许它把发布卡住**。详见「取官方 release 的更新内容」步骤。
+#
 # 应用内更新（本 fork 的 APK）：
 #   应用里的「检查更新」（lib/utils/update.dart 的非 iOS 分支）原生读的是 aierlma 的
 #   /releases，且用 release 的 created_at 与构建时写入的 pili.time 比较 —— 对我们这个 fork
@@ -783,6 +791,82 @@ jobs:
             PiliPlus-BTR-android-build-info.json
           retention-days: 14
 
+      # 把官方那一版的更新说明取来，贴在本仓库 release note 的最上方（详见文件头「release note 里的
+      # 官方更新内容」）。只在正式版贴；预览版贴同一份说明只会变成重复噪音。
+      # continue-on-error：这一步只是锦上添花，取不到官方正文也绝不能影响发 release。
+      - name: 取官方 release 的更新内容
+        id: official_notes
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          PRERELEASE: ${{ needs.resolve.outputs.prerelease }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          # 说明：这个步骤没有 output 时，下游 ${{ steps.official_notes.outputs.official }}
+          # 求值就是空字符串，所以下面每条「不贴」的分支直接 exit 0 即可，不用写空默认值。
+
+          if [ "$PRERELEASE" = "false" ]; then
+            use_notes=true
+          else
+            use_notes=false
+          fi
+
+          # force 覆盖已存在的正式 release 时，releases/latest 已经是它自己，resolve 会判成
+          # prerelease=true。这时沿用原 release 的正式/预览属性，否则一覆盖就把官方说明弄丢了。
+          if [ "$use_notes" != "true" ] && [ "$FORCE" = "true" ]; then
+            was_prerelease=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '.prerelease' 2>/dev/null || true)
+            if [ "$was_prerelease" = "false" ]; then
+              echo "这是 force 覆盖已存在的正式版 release，仍然贴官方更新内容"
+              use_notes=true
+            fi
+          fi
+
+          if [ "$use_notes" != "true" ]; then
+            echo "本次是预览版，不贴官方更新内容"
+            exit 0
+          fi
+
+          # UPSTREAM_REPO 是 git 地址，这里换成 API 用的 owner/repo。
+          slug=$(printf '%s' "$UPSTREAM_REPO" | sed -E 's#^https://github\.com/##; s#\.git$##')
+          # 官方 release 的 tag 就是版本号本身（官方 tag 里没有前缀）。
+          note_body=$(gh api "repos/$slug/releases/tags/$VERSION" --jq '.body // ""' 2>/dev/null || true)
+          note_url=$(gh api "repos/$slug/releases/tags/$VERSION" --jq '.html_url // ""' 2>/dev/null || true)
+          if [ -z "$note_body" ]; then
+            echo "::warning::取不到官方 $slug 的 release $VERSION（或它的正文为空），本次不贴官方更新内容"
+            exit 0
+          fi
+          if [ -z "$note_url" ]; then
+            note_url="https://github.com/$slug/releases/tag/$VERSION"
+          fi
+          # 官方正文里是 CRLF，去掉 \r 免得多余字符混进 Markdown。
+          note_body=$(printf '%s' "$note_body" | tr -d '\r')
+
+          # 正文是多行 Markdown，必须用带分隔符的写法写 $GITHUB_OUTPUT，普通 echo=... 会被截断。
+          # 分隔符撞车时补下划线，保证它不会出现在正文里。
+          delimiter="GH_OFFICIAL_NOTE_EOF"
+          while grep -qxF "$delimiter" <<< "$note_body"; do
+            delimiter="${delimiter}_"
+          done
+
+          {
+            echo "official<<$delimiter"
+            echo "## 官方 PiliPlus $VERSION 更新内容"
+            echo ""
+            echo "> 摘自官方 release：[$VERSION]($note_url)"
+            echo ""
+            printf '%s\n' "$note_body"
+            echo ""
+            echo "---"
+            echo ""
+            echo ""
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+          echo "已附上官方 $VERSION 的更新内容（${#note_body} 字节）"
+
       - name: 发布 release
         uses: softprops/action-gh-release@v3
         with:
@@ -797,6 +881,7 @@ jobs:
             PiliPlus-BTR-android-*.apk
             PiliPlus-BTR-android-build-info.json
           body: |
+            ${{ steps.official_notes.outputs.official }}
             PiliPlus BTR 安卓版（含 BTR 多 Range 并发加速），与 aierlma 的 iOS IPA 构建自同一个来源提交。
 
             - 版本：${{ needs.resolve.outputs.version }}（build ${{ needs.resolve.outputs.build }}）
