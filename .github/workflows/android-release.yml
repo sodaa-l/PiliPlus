@@ -267,7 +267,10 @@ jobs:
     needs: [resolve, stage]
     if: needs.resolve.outputs.skip != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # 90 → 150 分钟：正常全程约 20 分钟（最近一次 19.5 分钟），90 分钟对偶发的
+    # 网络/镜像卡顿没有余量 —— 上次就是这样整条被砍成 cancelled。真正需要快速失败的
+    # 是 apt 那一步，它已自带 20 分钟上限（见「安装 Linux 原生构建依赖」）。
+    timeout-minutes: 150
     permissions:
       contents: write
     steps:
@@ -474,11 +477,20 @@ jobs:
       # 要求 pkg-config 能找到 gtk+-3.0 / x11 / xi（macOS 上走别的分支，所以 aierlma 在 macos 上跑
       # 同样的测试不需要这些）。清单抄自本仓库自己的 Linux CI（linux_x64.yml），只额外补了报错点名的
       # libx11-dev / libxi-dev。
+      # 这一步曾经吃掉整个 job：apt 要下 197MB / 388 个包，某次镜像卡住后一直重试，
+      # 87 分钟过去测试和打包都还没开始，最后 job 撞上 90 分钟上限被砍成 cancelled。
+      # 所以它必须自己带上限，而不是把超时留给 job：
+      #   - Acquire::*::Timeout：单个连接卡住 30 秒就重开，不挂在半死连接上；
+      #   - Acquire::Retries：瞬时抖动自己重试，不把噪声变成流水线失败；
+      #   - timeout 20m + 步骤级 timeout-minutes：整步硬上限。真挂了就快速失败，
+      #     build 被记为 failure → record-failure 会开 issue（job 级超时记为 cancelled）。
       - name: 安装 Linux 原生构建依赖
+        timeout-minutes: 25
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y \
+          apt_opts=(-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3)
+          timeout 20m sudo apt-get "${apt_opts[@]}" update
+          timeout 20m sudo apt-get "${apt_opts[@]}" install -y --no-install-recommends \
             libgtk-3-dev libx11-dev libxi-dev \
             libayatana-appindicator3-dev webkit2gtk-4.1 libasound2-dev libmpv-dev
 
@@ -899,7 +911,9 @@ jobs:
   record-failure:
     name: 失败时开 issue 记录现场
     needs: [resolve, stage, build]
-    if: ${{ always() && (needs.resolve.result == 'failure' || needs.stage.result == 'failure' || needs.build.result == 'failure') }}
+    # cancelled 也算：job 撞上 timeout-minutes 时，GitHub 把结论记成 cancelled 而不是 failure，
+    # 只判 failure 会让「超时」这类最该被看见的故障完全静默 —— 上次 90 分钟超时就是这样没留下任何记录。
+    if: ${{ always() && (contains(fromJSON('["failure","cancelled"]'), needs.resolve.result) || contains(fromJSON('["failure","cancelled"]'), needs.stage.result) || contains(fromJSON('["failure","cancelled"]'), needs.build.result)) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
