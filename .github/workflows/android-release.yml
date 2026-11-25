@@ -66,6 +66,18 @@ on:
     # 每天 UTC 12:47（北京时间 20:47）。aierlma 的 iOS 流水线是 UTC 11:17 触发，
     # 留出约 90 分钟让它先把合并后的 btr 分支推上去，这里才不会构建到旧代码。
     - cron: '47 12 * * *'
+  # 兜底触发：iOS 那条（btr-maintain.yml，每天 UTC 11:17）跑完就顺带跑本流水线。
+  # 起因是 2026-10-26 之后 GitHub 侧不再投递 schedule 事件，两条定时流水线同时停摆，
+  # 而 GitHub 不允许手动「恢复」一个没被禁用的 schedule —— 只能再补一条触发路径。
+  #
+  # 为什么不判 conclusion：fork 里 btr-maintain 的每个 job 都因为
+  #   `if: github.repository == 'aierlma/PiliPlus'` 而 skipped，整条 run 的结论是 skipped 而不是
+  # success；只认 success 会让这条兜底永远不触发。它跳过了也照样说明「今天这一轮该发版了」，
+  # 构建什么由本流水线自己的 resolve 决定（重复提交会被 skip 判据挡掉）。
+  # 不加 branches 过滤，避免被触发 workflow 的运行分支与我们不一致时静默失效。
+  workflow_run:
+    workflows: ['BTR and PiliPlus sync and iOS release']
+    types: [completed]
   # 只在流水线自身定义变更时触发一次：既能自动验证对本文件的改动，也让人无需 gh CLI 就能跑一次。
   # 用 paths 限定，所以同步 fork、改业务代码都不会触发。
   # 分支跟到本文件所在的默认分支 apk-pipeline（见文件头说明）。
